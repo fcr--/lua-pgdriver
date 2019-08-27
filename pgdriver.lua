@@ -195,14 +195,19 @@ function Int16Array:format(buffer, i, value)
   if type(array) ~= 'table' then error('array expected on field ' .. self.name) end
   buffer[i] = encodeInt16(#array)
   for j = 1, #array do
-    i = :format(field, array[j])
+    buffer[i+j] = encodeInt16(array[j])
   end
-  -- TODO
+  return i + #array + 1
 end
--- TODO
 
 function Int16Array:parse(res, data, cursor)
-  -- TODO
+  local len = decodeInt16(data, cursor)
+  local arr = {}
+  for i = 1, len do
+    arr[i] = decodeInt16(data, cursor + 2 * i)
+  end
+  res[self.name] = arr
+  return cursor + 2 * (len + 1)
 end
 
 -------------------------------------------------------------------------------
