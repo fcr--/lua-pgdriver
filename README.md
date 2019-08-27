@@ -77,3 +77,8 @@ end
 -- uno     uno
 -- dos     dos
 ```
+
+## Running a load test:
+```bash
+time luajit -e 'require"pgdriver".load_test()' | tail
+```
