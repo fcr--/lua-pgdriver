@@ -26,9 +26,10 @@ pgdriver.MESSAGES_BY_CODE = {} -- id:char -> name:string -> message
 --[[ pgdriver attributes:
   socketWrapper: function that takes a connectable tcp/unix socket, and returns the socket that will be used:
     for simple synchronous tcp connections just leave the default (nil)
-    for ssl synchronous connections: function(skt)return ssl.wrap(skt, sslparams)end,
-    for asynchronous tcp (inside copas): copas.wrap,
-    for asynchronous ssl (inside copas): function(skt)return copas.wrap(skt, sslparams)end, ...
+    for asynchronous (for both tcp and ssl) (inside copas): copas.wrap,
+  sslSocketWrapper: function that takes a connected tcp socket, does ssl handshake and returns the socket that will be used:
+    for ssl synchronous connections: function(s)s=assert(ssl.wrap(s,sslparams));s:dohandshake()return s end,
+    for ssl over copas: function(s)s:dohandshake(sslparams)return s end
   host: hostname or ip (default localhost) to connect to
   port: port name or number (default 5432) to connect to
   connectparams: a table with the parameters to send to postgresql on connect
@@ -652,7 +653,8 @@ pgdriver.registerMessages {
 function pgdriver:_init(options)
   -- all parameters are deep copied
   self.socketWrapper = options.socketWrapper or function(skt) return skt end
-  self.host = options.host or 'localhost'
+  self.sslSocketWrapper = options.sslSocketWrapper
+  self.host = options.host
   self.port = options.port or 5432
   self.connectparams = {}
   for k, v in pairs(options.connectparams or {}) do
@@ -678,15 +680,27 @@ function pgdriver:_connect()
     self.socket = nil
   end
   self.status = 'Closed'
-  if unixOk then
-    self.socket = self.socketWrapper(unix())
+  if unixOk and not self.host then
+    self.socket = assert(self.socketWrapper(assert(unix())))
     if not self.socket:connect(self.unixPath) then self.socket = nil end
   end
   if not self.socket then
-    self.socket = self.socketWrapper(socket.tcp())
-    assert(self.socket:connect(self.host, self.port))
+    self.socket = assert(self.socketWrapper(assert(socket.tcp())))
+    assert(self.socket:connect(self.host or 'localhost', self.port))
   end
   -- print 'connected'
+  if self.sslSocketWrapper then
+    self:_send(self.MESSAGES.SSLRequest, {})
+    local S, msg = self.socket:receive(1)
+    if S == 'S' then -- ie: connection closed
+      self.socket = assert(self.sslSocketWrapper(self.socket))
+    else
+      pcall(self.socket.close, self.socket)
+      self.socket = nil
+      error(S and ('The server rejected the SSL request ('..S..')')
+              or ('failure reading ssl response from connection: ' .. msg))
+    end
+  end
   self:_send(self.MESSAGES.StartupMessage, {parameters = self.connectparams})
   name, pkt = self:_receive()
   if name == 'AuthenticationMD5Password' then
@@ -886,30 +900,56 @@ local function handle_errors(fn)
   end
 end
 
-copas.addthread(handle_errors(function()
-  local dbs = {}
-  for i = 1, 10 do
-    q:addthread(handle_errors(function(i)
-      dbs[i] = pgdriver:new{socketWrapper=copas.wrap}
-    end), i)
-  end
-  q:wait()
-  print 'connected'
-  for i = 1, 100000 do
-    q:addthread(handle_errors(function()
-      local db = table.remove(dbs)
-      local nrows = 0
-      for row in db:query('select 1+1 as pelota union all select 3') do
-        nrows = nrows + 1
-        --print(i, row.pelota)
-        --print(i, #dbs, 'row:', tabletostring(row))
-      end
-      print(i, nrows)
-      table.insert(dbs, db)
-    end))
-  end
-  q:wait()
-end))
-copas.loop()
+local ssl = require'ssl'
+local sslparams = {
+  mode = 'client',
+  protocol = 'tlsv1_2',
+  key = os.getenv'HOME' .. '/.postgresql/postgresql.key',
+  certificate = os.getenv'HOME' .. '/.postgresql/postgresql.crt',
+  cafile = os.getenv'HOME' .. '/.postgresql/root.crt',
+  verify = "peer",
+  options = {"all", "no_sslv3"}
+}
+
+-- example for unix namespace sockets:
+-- db=pgdriver:new{} --sync+unix
+-- db=pgdriver:new{socketWrapper=copas.wrap} --copas+unix
+
+-- examples for tcp:
+-- db=pgdriver:new{host='localhost', password='foobar'} --sync+tcp
+-- db=pgdriver:new{host='localhost', password='foobar', socketWrapper=copas.wrap} --copas+tcp
+
+-- examples for ssl:
+-- db=pgdriver:new{host='fideo',sslSocketWrapper=function(s)s=assert(ssl.wrap(s,sslparams));s:dohandshake()return s end} --sync+ssl
+-- db=pgdriver:new{host='fideo', socketWrapper=copas.wrap,
+--      sslSocketWrapper=function(s)s:dohandshake(sslparams)return s end} --copas+ssl
+
+function pgdriver.load_test()
+  copas.addthread(handle_errors(function()
+    local dbs = {}
+    for i = 1, 10 do
+      q:addthread(handle_errors(function(i)
+        dbs[i] = pgdriver:new{socketWrapper=copas.wrap}
+      end), i)
+    end
+    q:wait()
+    print 'connected'
+    for i = 1, 100000 do
+      q:addthread(handle_errors(function()
+        local db = table.remove(dbs)
+        local nrows = 0
+        for row in db:query('select 1+1 as pelota union all select 3') do
+          nrows = nrows + 1
+          --print(i, row[1], row.pelota)
+          --print(i, #dbs, 'row:', tabletostring(row))
+        end
+        print(i, nrows)
+        table.insert(dbs, db)
+      end))
+    end
+    q:wait()
+  end))
+  copas.loop()
+end
 
 return pgdriver
