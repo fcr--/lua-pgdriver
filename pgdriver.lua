@@ -124,14 +124,28 @@ end
 
 -- this method may be called by the child classes to simplify the constructor code
 function AbstractField:initprops(props, options)
+  local maxn = 0
   for k, v in pairs(options) do
-    assert(props[k], 'option ' .. k .. ' not supported in type ' .. self.T)
+    if type(k) == 'number' and props['children'] then
+      maxn = math.max(maxn, k)
+    else
+      assert(props[k], 'option ' .. k .. ' not supported in type ' .. self.T)
+    end
   end
   for k, v in pairs(props) do
     local typesmap = {}
     for t in v:gmatch'%w+' do typesmap[t] = true end
-    assert(typesmap[type(options[k])], 'option ' .. k .. ' does not have type ' .. v)
-    self[k] = options[k]
+    if k == 'children' then
+      self.children = {}
+      for i = 1, #options do
+        assert(typesmap[type(options[i])], 'option ' .. i .. ' does not have type ' .. v)
+        self.children[i] = options[i]
+      end
+      assert(maxn == #options, 'disperse array option')
+    else
+      assert(typesmap[type(options[k])], 'option ' .. k .. ' does not have type ' .. v)
+      self[k] = options[k]
+    end
   end
 end
 
@@ -140,13 +154,47 @@ function AbstractField:__call(...)
   return self:new(...)
 end
 
-function AbstractField:formatrec(buffer, i, value)
+function AbstractField:format(buffer, i, value)
   error('Field ' .. self.name .. ':' .. self.T .. ' does not support formatting')
+end
+
+-- messageType: (forall T. T <: AbstractField)[], or just an array of AbstractField descendant instances
+-- value: record to encode
+function AbstractField.formatrec(messageType, value)
+  local buffer = {}
+  local i = 1
+  for _, field in ipairs(messageType) do
+    i = field:format(buffer, i, value)
+  end
+  if buffer.lengthField then
+    local length = 4
+    for i = buffer.lengthField + 1, #buffer do
+      length = length + #buffer[i]
+    end
+    buffer[buffer.lengthField] = encodeInt32(length)
+  end
+  return table.concat(buffer)
 end
 
 function AbstractField:parse(res, data, cursor)
   error('Field ' .. self.name .. ':' .. self.T .. ' does not support parsing')
 end
+
+-- return: nil, errormessage
+--     or: res, cursor
+function AbstractField.parserec(messageType, data, cursor)
+  local res, msg = {}
+  cursor = cursor or 1
+  for _, field in ipairs(messageType) do
+    if not field.parse then
+      error('field ' .. field.name .. ' typed ' .. field.T .. ' does not support parse')
+    end
+    cursor, msg = field:parse(res, data, cursor)
+    if not cursor then return nil, msg end
+  end
+  return res, cursor
+end
+
 
 -------------------------------------------------------------------------------
 
@@ -181,13 +229,36 @@ end
 
 -------------------------------------------------------------------------------
 
+local Int16 = class(AbstractField):with{T='Int16'}
+pgdriver.types.Int16 = Int16
+
+function Int16:_init(options)
+  self:initprops({name='string', value='number|nil'}, options)
+end
+
+function Int16:format(buffer, i, value)
+  value = value[self.name] or self.value
+  if type(value) ~= 'number' then error('number expected on field ' .. self.name) end
+  buffer[i] = encodeInt16(value)
+  return i + 1
+end
+
+function Int16:parse(res, data, cursor)
+  local value = decodeInt16(data, cursor)
+  if self.value and value ~= self.value then
+    return nil, ('%q received, %q expected on field %s'):format(value, self.value, self.name)
+  end
+  res[self.name] = value
+  return cursor + 2
+end
+
+-------------------------------------------------------------------------------
+
 local Int16Array = class(AbstractField):with{T='Int16Array'}
 pgdriver.types.Int16Array = Int16Array
 
 function Int16Array:_init(options)
-  self.children = {}
-  for i, child in ipairs(options) do self.children[i] = child end
-  self.initprops({name='string'}, options)
+  self:initprops({name='string', children='table'}, options)
 end
 
 function Int16Array:format(buffer, i, value)
@@ -195,19 +266,85 @@ function Int16Array:format(buffer, i, value)
   if type(array) ~= 'table' then error('array expected on field ' .. self.name) end
   buffer[i] = encodeInt16(#array)
   for j = 1, #array do
-    buffer[i+j] = encodeInt16(array[j])
+    buffer[i+j] = AbstractField.formatrec(self.children, array[j])
   end
   return i + #array + 1
 end
 
 function Int16Array:parse(res, data, cursor)
-  local len = decodeInt16(data, cursor)
-  local arr = {}
-  for i = 1, len do
-    arr[i] = decodeInt16(data, cursor + 2 * i)
+  local array = {}
+  local count = decodeInt16(data, cursor)
+  cursor = cursor + 2
+  for i = 1, count do
+    local arg1, arg2 = AbstractField.parserec(self.children, data, cursor)
+    if not arg1 then
+      return nil, arg2 -- nil, error string
+    else
+      array[i] = arg1
+      cursor = arg2
+    end
   end
-  res[self.name] = arr
-  return cursor + 2 * (len + 1)
+  res[self.name] = array
+  return cursor
+end
+
+-------------------------------------------------------------------------------
+
+local Int32 = class(AbstractField):with{T='String'}
+pgdriver.types.Int32 = Int32
+
+function Int32:_init(options)
+  self:initprops({name='string', value='number|nil'}, options)
+end
+
+function Int32:format(buffer, i, value)
+  value = value[self.name] or self.value
+  if type(value) ~= 'number' then error('number expected on field ' .. self.name) end
+  buffer[i] = encodeInt32(value)
+  return i + 1
+end
+
+function Int32:parse(res, data, cursor)
+  local value = decodeInt32(data, cursor)
+  if self.value and value ~= self.value then
+    return nil, ('%q received, %q expected on field %s'):format(value, self.value, self.name)
+  end
+  res[self.name] = value
+  return cursor + 4
+end
+
+-------------------------------------------------------------------------------
+
+local Int32Bytes = class(AbstractField):with{T='String'}
+pgdriver.types.Int32Bytes = Int32Bytes
+
+function Int32Bytes:_init(options)
+  self:initprops({name='string', value='string|nil'}, options)
+end
+
+function Int32Bytes:format(buffer, i, value)
+  value = value[self.name] or self.value
+  if value == nil then
+    buffer[i] = encodeInt32(-1)
+    return i + 1
+  end
+  if type(value) ~= 'string' then error('string expected on field ' .. self.name) end
+  buffer[i] = encodeInt32(#value)
+  buffer[i+1] = value
+  return i + 2
+end
+
+function Int32Bytes:parse(res, data, cursor)
+  local len = decodeInt32(data:sub(cursor, cursor + 3))
+  cursor = cursor + 4
+  -- len < 0 indicates a null parameter value
+  if len >= 0 then
+    res[self.name] = data:sub(cursor, cursor + len - 1)
+  end
+  if self.value and res[self.name] ~= self.value then
+    return nil, ('expected value %d, received %d'):format(self.value, res[self.name])
+  end
+  return cursor + math.max(0, len)
 end
 
 -------------------------------------------------------------------------------
@@ -229,7 +366,7 @@ end
 function Int32Length:parse(res, data, cursor)
   res[self.name] = decodeInt32(data, cursor)
   if res[self.name] > #data - cursor + 1 then
-    return nil, ('packet size from cursor=%d, length field=%d'):format(#data - cursor + 1, res[field.name])
+    return nil, ('packet size from cursor=%d, length field=%d'):format(#data - cursor + 1, res[self.name])
   end
   return cursor + 4
 end
@@ -261,6 +398,32 @@ end
 
 -------------------------------------------------------------------------------
 
+local StringMap = class(AbstractField):with{T='StringMap'}
+pgdriver.types.StringMap = StringMap
+
+function StringMap:_init(options)
+  self:initprops({name='string', mandatory='table|nil'}, options)
+end
+
+function StringMap:format(buffer, i, value)
+  value = value[self.name]
+  assert(type(value) == 'table', 'table expected on field ' .. self.name)
+  if self.mandatory then
+    for _, k in ipairs(self.mandatory) do
+      assert(type(value[k]) ~= 'nil', 'key ' .. k .. ' expected on field ' .. self.name)
+    end
+  end
+  for k, v in pairs(value) do
+    buffer[i], buffer[i + 1] = tostring(k), nullbyte
+    buffer[i + 2], buffer[i + 3] = tostring(v), nullbyte
+    i = i + 4
+  end
+  buffer[i] = nullbyte
+  return i + 1
+end
+
+-------------------------------------------------------------------------------
+
 function pgdriver.registerMessages(messages)
   for name, msg in pairs(messages) do
     if msg[1].T == 'Bytes' and type(msg[1].value) == 'string' and #msg[1].value == 1 and msg[2].T == 'Int32Length' then
@@ -277,23 +440,25 @@ function pgdriver.registerMessages(messages)
   end
 end
 
+-- Based on: https://www.postgresql.org/docs/9.3/protocol-message-formats.html
+-- list of messages only sent by pgdriver:
 pgdriver.FE_MESSAGES = {
   Bind = {
     Bytes{name='id', value='B', length=1},
     Int32Length{name='length'},
     String{name='destination'},
     String{name='source'},
-    {name='parameterFormats', T='Int16Array',
-      {name='code', T='Int16'}},
-    {name='parameterValues', T='Int16Array',
-      {name='value', T='Int32Bytes'}},
-    {name='resultFormats', T='Int16Array',
-      {name='code', T='Int16'}}},
+    Int16Array{name='parameterFormats',
+      Int16{name='code'}},
+    Int16Array{name='parameterValues',
+      Int32Bytes{name='value'}},
+    Int16Array{name='resultFormats',
+      Int16{name='code'}}},
   CancelRequest = {
     Int32Length{name='length'},
-    {name='code', T='Int32', value=1234*65536 + 5678},
-    {name='pid', T='Int32'},
-    {name='secret', T='Int32'}},
+    Int32{name='code', value=1234*65536 + 5678},
+    Int32{name='pid'},
+    Int32{name='secret'}},
   Close = {
     Bytes{name='id', value='C', length=1},
     Int32Length{name='length'},
@@ -308,53 +473,57 @@ pgdriver.FE_MESSAGES = {
     Bytes{name='id', value='E', length=1},
     Int32Length{name='length'},
     String{name='portal'},
-    {name='maxrows', T='Int32'}},
+    Int32{name='maxrows'}},
   Query = {
     Bytes{name='id', value='Q', length=1},
     Int32Length{name='length'},
     String{name='query'}}
 }
--- Based on: https://www.postgresql.org/docs/9.3/protocol-message-formats.html
+
+-- Messages that can be received from the server, or (F&B) when they can be
+-- sent by the driver as well.  They will be registered in pgdriver.MESSAGES.
+-- Also, those with a Bytes{name='id', value=?, length=1} in their first field
+-- will be registered into pgdriver.MESSAGES_BY_CODE.
 pgdriver.registerMessages {
   AuthenticationOk = {
     Bytes{name='id', value='R', length=1},
     Int32Length{name='length'},
-    {name='code', T='Int32', value=0}},
+    Int32{name='code', value=0}},
   AuthenticationKerberosV5 = {
     Bytes{name='id', value='R', length=1},
     Int32Length{name='length'},
-    {name='code', T='Int32', value=2}},
+    Int32{name='code', value=2}},
   AuthenticationCleartextPassword = {
     Bytes{name='id', value='R', length=1},
     Int32Length{name='length'},
-    {name='code', T='Int32', value=3}},
+    Int32{name='code', value=3}},
   AuthenticationMD5Password = {
     Bytes{name='id', value='R', length=1},
     Int32Length{name='length'},
-    {name='code', T='Int32', value=5},
+    Int32{name='code', value=5},
     Bytes{name='salt', length=4}},
   AuthenticationSCMCredential = {
     Bytes{name='id', value='R', length=1},
     Int32Length{name='length'},
-    {name='code', T='Int32', value=6}},
+    Int32{name='code', value=6}},
   AuthenticationGSS = {
     Bytes{name='id', value='R', length=1},
     Int32Length{name='length'},
-    {name='code', T='Int32', value=7}},
+    Int32{name='code', value=7}},
   AuthenticationSSPI = {
     Bytes{name='id', value='R', length=1},
     Int32Length{name='length'},
-    {name='code', T='Int32', value=9}},
+    Int32{name='code', value=9}},
   AuthenticationGSSContinue = {
     Bytes{name='id', value='R', length=1},
     Int32Length{name='length'},
-    {name='code', T='Int32', value=8},
-    {name='authdata', T='Int32'}},
+    Int32{name='code', value=8},
+    Int32{name='authdata'}},
   BackendKeyData = {
     Bytes{name='id', value='K', length=1},
     Int32Length{name='length'},
-    {name='pid', T='Int32'},
-    {name='secret', T='Int32'}},
+    Int32{name='pid'},
+    Int32{name='secret'}},
   BindComplete = {
     Bytes{name='id', value='1', length=1},
     Int32Length{name='length'}},
@@ -365,15 +534,15 @@ pgdriver.registerMessages {
     Bytes{name='id', value='C', length=1},
     Int32Length{name='length'},
     String{name='command'}},
-  CopyData = {
+  CopyData = { -- (F&B)
     Bytes{name='id', value='d', length=1},
     Int32Length{name='length'},
     Bytes{name='data'}},
   DataRow = {
     Bytes{name='id', value='D', length=1},
     Int32Length{name='length'},
-    {name='cols', T='Int16Array',
-      {name='data', T='Int32Bytes'}}},
+    Int16Array{name='cols',
+      Int32Bytes{name='data'}}},
   -- ...
   EmptyQueryResponse = {
     Bytes{name='id', value='I', length=1},
@@ -390,20 +559,20 @@ pgdriver.registerMessages {
   FunctionCall = {
     Bytes{name='id', value='F', length=1},
     Int32Length{name='length'},
-    {name='oid', T='Int32'},
-    {name='formats', T='Int16Array',
-      {name='code', T='Int16'}}, -- 0=text, 1=binary
-    {name='values', T='Int16Array',
-      {name='value', T='Int32Bytes'}},
-    {name='resultCode', T='Int16'}}, -- 0=text, 1=binary
+    Int32{name='oid'},
+    Int16Array{name='formats',
+      Int16{name='code'}}, -- 0=text, 1=binary
+    Int16Array{name='values',
+      Int32Bytes{name='value'}},
+    Int16{name='resultCode'}}, -- 0=text, 1=binary
   FunctionCallResponse = {
     Bytes{name='id', value='V', length=1},
     Int32Length{name='length'},
-    {name='response', T='Int32Bytes'}},
+    Int32Bytes{name='response'}},
   NegotiateProtocolVersion = {
     Bytes{name='id', value='v', length=1},
     Int32Length{name='length'},
-    {name='newestminor', T='Int32'},
+    Int32{name='newestminor'},
     {name='notrecognized', T='Int32Array',
       String{name='name'}}},
   NoData = {
@@ -418,14 +587,14 @@ pgdriver.registerMessages {
   NotificationResponse = {
     Bytes{name='id', value='A', length=1},
     Int32Length{name='length'},
-    {name='pid', T='Int32'},
+    Int32{name='pid'},
     String{name='channel'},
     String{name='payload'}},
   ParameterDescription = {
     Bytes{name='id', value='t', length=1},
     Int32Length{name='length'},
-    {name='parameters', T='Int16Array',
-      {name='typeoid', T='Int32'}}},
+    Int16Array{name='parameters',
+      Int32{name='typeoid'}}},
   ParameterStatus = {
     Bytes{name='id', value='S', length=1},
     Int32Length{name='length'},
@@ -436,8 +605,8 @@ pgdriver.registerMessages {
     Int32Length{name='length'},
     String{name='name'},
     String{name='query'},
-    {name='parameters', T='Int16Array',
-      {name='typeoid', T='Int32'}}},
+    Int16Array{name='parameters',
+      Int32{name='typeoid'}}},
   ParseComplete = {
     Bytes{name='id', value='1', length=1},
     Int32Length{name='length'}},
@@ -455,21 +624,21 @@ pgdriver.registerMessages {
   RowDescription = {
     Bytes{name='id', value='T', length=1},
     Int32Length{name='length'},
-    {name='cols', T='Int16Array',
+    Int16Array{name='cols',
       String{name='name'},
-      {name='oid', T='Int32'},
-      {name='colnum', T='Int16'},
-      {name='typeoid', T='Int32'},
-      {name='typelen', T='Int16'}, -- negative values mean variable size
-      {name='atttypmod', T='Int32'},
-      {name='format', T='Int16'}}}, -- 0=text, 1=binary
+      Int32{name='oid'},
+      Int16{name='colnum'},
+      Int32{name='typeoid'},
+      Int16{name='typelen'}, -- negative values mean variable size
+      Int32{name='atttypmod'},
+      Int16{name='format'}}}, -- 0=text, 1=binary
   SSLRequest = {
     Int32Length{name='length'},
-    {name='code', T='Int32', value=1234*65536 + 5679}},
+    Int32{name='code', value=1234*65536 + 5679}},
   StartupMessage = {
     Int32Length{name='length'},
-    {name='version', T='Int32', value=3*65536 + 0},
-    {name='parameters', T='StringMap', mandatory={'user'}}},
+    Int32{name='version', value=3*65536 + 0},
+    StringMap{name='parameters', mandatory={'user'}}},
   Sync = {
     Bytes{name='id', value='S', length=1},
     Int32Length{name='length'}},
@@ -543,6 +712,7 @@ function pgdriver:_connect()
   end
 end
 
+-- return: messagename, res
 function pgdriver:_receive(messageTypes)
   local headerlen = 5
   local header, body, len, msg
@@ -561,46 +731,43 @@ function pgdriver:_receive(messageTypes)
     self.socket:close()
     error('failure reading header from connection: ' .. msg)
   end
-  len = decodeInt32(header:sub(headerlen - 3))
+  len = decodeInt32(header, headerlen - 3)
   assert(len >= 4, 'wrong length received')
   body, msg = self.socket:receive(len - 4)
   if not messageTypes then
     messageTypes = self.MESSAGES_BY_CODE[header:sub(1, 1)]
-    assert(messageTypes, ('invalid message format %q'):format(header:sub(1, 1)))
+    if not messageTypes then
+      assert(false, ('invalid message format %q'):format(header:sub(1, 1)))
+    end
   end
   local errors = {'Parsing failed:'}
   for name, msg in pairs(messageTypes) do
     local data = header .. body
-    local pkt, err = self:_parse(msg, data)
-    if pkt then
-      if err ~= #data + 1 then print(('error? out of sync %s, %d!=%d+1, data=%q'):format(name, err, #data, data)) end
+    local pkt, arg2 = AbstractField.parserec(msg, data) -- self:_parse(msg, data)
+    if pkt then -- arg2 is the resulting cursor
+      if arg2 ~= #data + 1 then
+        print(('error? out of sync %s, %d!=%d+1, data=%q'):format(name, arg2, #data, data))
+      end
       return name, pkt
+    else -- arg2 is an error value
+      errors[#errors + 1] = ('  %q: %s'):format(name, arg2)
     end
-    errors[#errors + 1] = ('  %q: %s'):format(name, err)
   end
   error(table.concat(errors, '\n'))
 end
 
 function pgdriver:_send(messageType, pkt)
-  self.socket:send(pgdriver._format(messageType, pkt))
+  -- self.socket:send(pgdriver._format(messageType, pkt))
+  self.socket:send(AbstractField.formatrec(messageType, pkt))
 end
 
+-- DEPRECATED
 function pgdriver._format(messageType, value)
   local buffer = {}
   local i = 1
   for _, field in ipairs(messageType) do
     if field.format then
       i = field:format(buffer, i, value)
-    elseif field.T == 'Int16' then
-      local value = value[field.name] or field.value
-      assert(type(value) == 'number', 'integer expected on field ' .. field.name)
-      buffer[i] = encodeInt16(value)
-      i = i + 1
-    elseif field.T == 'Int32' then
-      local value = value[field.name] or field.value
-      assert(type(value) == 'number', 'integer expected on field ' .. field.name)
-      buffer[i] = encodeInt32(value)
-      i = i + 1
     elseif field.T == 'Int32Array' then
       local array = value[field.name]
       assert(type(array) == 'table', 'array expected on field ' .. field.name)
@@ -608,28 +775,6 @@ function pgdriver._format(messageType, value)
       for j = 1, #array do
         subbuffer[j+1] = pgdriver._format(field, array[j])
       end
-      buffer[i] = table.concat(subbuffer)
-      i = i + 1
-    elseif field.T == 'Int32Bytes' then
-      local value = value[field.name] or field.value
-      assert(value == nil or type(value) == 'string', 'string expected on field ' .. field.name)
-      buffer[i] = value and encodeInt32(#value) .. value or encodeInt32(-1)
-      i = i + 1
-    elseif field.T == 'StringMap' then
-      local value = value[field.name]
-      assert(type(value) == 'table', 'table expected on field ' .. field.name)
-      local subbuffer, j = {}, 0
-      if field.mandatory then
-        for _, k in ipairs(field.mandatory) do
-          assert(type(value[k]) ~= nil, 'key ' .. k .. ' expected on field ' .. field.name)
-        end
-      end
-      for k, v in pairs(value) do
-        subbuffer[j + 1], subbuffer[j + 2] = tostring(k), nullbyte
-        subbuffer[j + 3], subbuffer[j + 4] = tostring(v), nullbyte
-        j = j + 4
-      end
-      subbuffer[j + 1] = nullbyte
       buffer[i] = table.concat(subbuffer)
       i = i + 1
     else
@@ -646,51 +791,13 @@ function pgdriver._format(messageType, value)
   return table.concat(buffer)
 end
 
+-- DEPRECATED
 function pgdriver:_parse(messageType, data)
   local cursor, res, msg = 1, {}
   for _, field in ipairs(messageType) do
     if field.parse then
       cursor, msg = field:parse(res, data, cursor)
       if not cursor then return nil, msg end
-    elseif field.T == 'Int16' then
-      if #data < cursor + 1 then return nil, 'incomplete field '..field.name end
-      res[field.name] = decodeInt16(data:sub(cursor, cursor + 3))
-      if field.value and res[field.name] ~= field.value then
-        return nil, ('expected value %d, received %d'):format(field.value, res[field.name])
-      end
-      cursor = cursor + 2
-    elseif field.T == 'Int32' then
-      if #data < cursor + 3 then return nil, 'incomplete field '..field.name end
-      res[field.name] = decodeInt32(data:sub(cursor, cursor + 3))
-      if field.value and res[field.name] ~= field.value then
-        return nil, ('expected value %d, received %d'):format(field.value, res[field.name])
-      end
-      cursor = cursor + 4
-    elseif field.T == 'Int16Array' then
-      local buffer = {}
-      local count = decodeInt16(data:sub(cursor, cursor + 1))
-      cursor = cursor + 2
-      for i = 1, count do
-        local arg1, arg2 = self:_parse(field, data:sub(cursor))
-        if not arg1 then
-          return nil, arg2
-        else
-          buffer[#buffer+1] = arg1
-          cursor = cursor + arg2 - 1
-        end
-      end
-      res[field.name] = buffer
-    elseif field.T == 'Int32Bytes' then
-      if #data < cursor + 3 then return nil, 'incomplete field '..field.name end
-      local len = decodeInt32(data:sub(cursor, cursor + 3))
-      cursor = cursor + 4
-      if len >= 0 then
-        res[field.name] = data:sub(cursor, cursor + len - 1)
-      end
-      if field.value and res[field.name] ~= field.value then
-        return nil, ('expected value %d, received %d'):format(field.value, res[field.name])
-      end
-      cursor = cursor + math.max(0, len)
     elseif field.T == 'NilTerminatedArray' then
       local buffer = {}
       while (data:sub(cursor, cursor) or '\0') ~= '\0' do
@@ -767,30 +874,42 @@ copas.limit = require 'copas.limit'
 copas.autoclose = false
 local q = copas.limit.new(10)
 
-copas.addthread(function()
+local function handle_errors(fn)
+  local _unpack = unpack or table.unpack
+  local function handler(err)
+    io.stderr:write(debug.traceback(tostring(err), 2), '\n')
+    return err
+  end
+  return function(...)
+    local res = {xpcall(fn, handler, ...)}
+    if res[1] then return _unpack(res, 2) else error(res[2]) end
+  end
+end
+
+copas.addthread(handle_errors(function()
   local dbs = {}
   for i = 1, 10 do
-    q:addthread(function(i)
+    q:addthread(handle_errors(function(i)
       dbs[i] = pgdriver:new{socketWrapper=copas.wrap}
-    end, i)
+    end), i)
   end
   q:wait()
   print 'connected'
   for i = 1, 100000 do
-    q:addthread(function()
+    q:addthread(handle_errors(function()
       local db = table.remove(dbs)
       local nrows = 0
-      for row in db:query('select 1+1 as pelota union select 3') do
+      for row in db:query('select 1+1 as pelota union all select 3') do
         nrows = nrows + 1
         --print(i, row.pelota)
         --print(i, #dbs, 'row:', tabletostring(row))
       end
       print(i, nrows)
       table.insert(dbs, db)
-    end)
+    end))
   end
   q:wait()
-end)
+end))
 copas.loop()
 
 return pgdriver
