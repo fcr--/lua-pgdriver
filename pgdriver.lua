@@ -2,7 +2,7 @@ pcall(require, 'host.init.__pkg') -- integration with ulua
 pcall(require, 'luarocks.loader') -- try to use luarocks loader
 local socket = require 'socket'
 local unixOk, unix = pcall(require, 'socket.unix')
-local copas = require 'copas'
+local copasOk, copas = pcall(require, 'copas')
 
 local function class(super)
   local mt = setmetatable({}, super)
@@ -316,6 +316,26 @@ end
 
 -------------------------------------------------------------------------------
 
+local Int32Array = class(AbstractField):with{T='Int32Array'}
+pgdriver.types.Int32Array = Int32Array
+
+function Int32Array:_init(options)
+  self:initprops({name='string', children='table'}, options)
+end
+
+function Int32Array:format(buffer, i, value)
+  local array = value[self.name]
+  if type(array) ~= 'table' then error('array expected on field ' .. self.name) end
+  buffer[i] = encodeInt32(#array)
+  for j = 1, #array do
+    buffer[i+j] = AbstractField.formatrec(self.children, array[j])
+  end
+  return i + #array + 1
+end
+
+
+-------------------------------------------------------------------------------
+
 local Int32Bytes = class(AbstractField):with{T='String'}
 pgdriver.types.Int32Bytes = Int32Bytes
 
@@ -370,6 +390,30 @@ function Int32Length:parse(res, data, cursor)
     return nil, ('packet size from cursor=%d, length field=%d'):format(#data - cursor + 1, res[self.name])
   end
   return cursor + 4
+end
+
+-------------------------------------------------------------------------------
+
+local NilTerminatedArray = class(AbstractField):with{T='NilTerminatedArray'}
+pgdriver.types.NilTerminatedArray = NilTerminatedArray
+
+function NilTerminatedArray:_init(options)
+  self:initprops({name='string', children='table'}, options)
+end
+
+function NilTerminatedArray:parse(res, data, cursor)
+  local buffer = {}
+  while (data:byte(cursor) or 0) ~= 0 do
+    local arg1, arg2 = AbstractField.parserec(self.children, data, cursor)
+    if not arg1 then
+      return nil, arg2
+    end
+    buffer[#buffer+1] = arg1
+    cursor = arg2
+  end
+  res[self.name] = buffer
+  if cursor > #data then return nil, ('unexpected EOP at %d on field %s'):format(cursor, self.name) end
+  return cursor + 1
 end
 
 -------------------------------------------------------------------------------
@@ -551,7 +595,7 @@ pgdriver.registerMessages {
   ErrorResponse = {
     Bytes{name='id', value='E', length=1},
     Int32Length{name='length'},
-    {name='fields', T='NilTerminatedArray',
+    NilTerminatedArray{name='fields',
       Bytes{name='type', length=1},
       String{name='value'}}},
   Flush = {
@@ -574,7 +618,7 @@ pgdriver.registerMessages {
     Bytes{name='id', value='v', length=1},
     Int32Length{name='length'},
     Int32{name='newestminor'},
-    {name='notrecognized', T='Int32Array',
+    Int32Array{name='notrecognized',
       String{name='name'}}},
   NoData = {
     Bytes{name='id', value='n', length=1},
@@ -582,7 +626,7 @@ pgdriver.registerMessages {
   NoticeResponse = {
     Bytes{name='id', value='N', length=1},
     Int32Length{name='length'},
-    {name='body', T='NilTerminatedArray',
+    NilTerminatedArray{name='body',
       Bytes{name='type', length=1},
       String{name='value'}}},
   NotificationResponse = {
@@ -757,7 +801,7 @@ function pgdriver:_receive(messageTypes)
   local errors = {'Parsing failed:'}
   for name, msg in pairs(messageTypes) do
     local data = header .. body
-    local pkt, arg2 = AbstractField.parserec(msg, data) -- self:_parse(msg, data)
+    local pkt, arg2 = AbstractField.parserec(msg, data)
     if pkt then -- arg2 is the resulting cursor
       if arg2 ~= #data + 1 then
         print(('error? out of sync %s, %d!=%d+1, data=%q'):format(name, arg2, #data, data))
@@ -771,66 +815,7 @@ function pgdriver:_receive(messageTypes)
 end
 
 function pgdriver:_send(messageType, pkt)
-  -- self.socket:send(pgdriver._format(messageType, pkt))
   self.socket:send(AbstractField.formatrec(messageType, pkt))
-end
-
--- DEPRECATED
-function pgdriver._format(messageType, value)
-  local buffer = {}
-  local i = 1
-  for _, field in ipairs(messageType) do
-    if field.format then
-      i = field:format(buffer, i, value)
-    elseif field.T == 'Int32Array' then
-      local array = value[field.name]
-      assert(type(array) == 'table', 'array expected on field ' .. field.name)
-      local subbuffer = {encodeInt16(#array)}
-      for j = 1, #array do
-        subbuffer[j+1] = pgdriver._format(field, array[j])
-      end
-      buffer[i] = table.concat(subbuffer)
-      i = i + 1
-    else
-      error('unsupported field type '..field.T)
-    end
-  end
-  if buffer.lengthField then
-    local length = 4
-    for i = buffer.lengthField + 1, #buffer do
-      length = length + #buffer[i]
-    end
-    buffer[buffer.lengthField] = encodeInt32(length)
-  end
-  return table.concat(buffer)
-end
-
--- DEPRECATED
-function pgdriver:_parse(messageType, data)
-  local cursor, res, msg = 1, {}
-  for _, field in ipairs(messageType) do
-    if field.parse then
-      cursor, msg = field:parse(res, data, cursor)
-      if not cursor then return nil, msg end
-    elseif field.T == 'NilTerminatedArray' then
-      local buffer = {}
-      while (data:sub(cursor, cursor) or '\0') ~= '\0' do
-        local arg1, arg2 = self:_parse(field, data:sub(cursor))
-        if not arg1 then
-          return nil, arg2
-        else
-          buffer[#buffer+1] = arg1
-          cursor = cursor + arg2 - 1
-        end
-      end
-      res[field.name] = buffer
-      if cursor > #data then return nil, ('unexpected EOP at %d on field %s'):format(cursor, field.name) end
-      cursor = cursor + 1
-    else
-      error('unsupported field type '..field.T)
-    end
-  end
-  return res, cursor
 end
 
 -- consumes a single message blocking, then advancing the current state of the state machine
@@ -884,10 +869,6 @@ end
 --   pgdriver:new{unixPath='/var/local/run/postgresql/.s.PGSQL.<port>',connectparams.database='template1'}
 --   pgdriver:new{host='1.2.3.4',connectparams.user='myuser',password='mypassword'}
 
-copas.limit = require 'copas.limit'
-copas.autoclose = false
-local q = copas.limit.new(10)
-
 local function handle_errors(fn)
   local _unpack = unpack or table.unpack
   local function handler(err)
@@ -924,7 +905,25 @@ local sslparams = {
 -- db=pgdriver:new{host='fideo', socketWrapper=copas.wrap,
 --      sslSocketWrapper=function(s)s:dohandshake(sslparams)return s end} --copas+ssl
 
+function pgdriver.sync_load_test()
+  local db = pgdriver:new{}
+  print 'connected'
+  for i = 1, 100000 do
+    local nrows = 0
+    for row in db:query('select 1+1 as pelota union all select 3') do
+      nrows = nrows + 1
+      --print(i, row[1], row.pelota)
+      --print(i, #dbs, 'row:', tabletostring(row))
+    end
+    --print(i, nrows)
+  end
+end
+
 function pgdriver.load_test()
+  copas.limit = require 'copas.limit'
+  copas.autoclose = false
+  local q = copas.limit.new(10)
+
   copas.addthread(handle_errors(function()
     local dbs = {}
     for i = 1, 10 do
