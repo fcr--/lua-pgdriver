@@ -491,7 +491,7 @@ pgdriver.FE_MESSAGES = {
   Bind = {
     Bytes{name='id', value='B', length=1},
     Int32Length{name='length'},
-    String{name='destination'},
+    String{name='portal'},
     String{name='source'},
     Int16Array{name='parameterFormats',
       Int16{name='code'}},
@@ -509,6 +509,10 @@ pgdriver.FE_MESSAGES = {
     Int32Length{name='length'},
     Bytes{name='type', length=1}, -- 'S' (statement) or 'P' (portal)
     String{name='name'}},
+  CopyData = { -- (F&B)
+    Bytes{name='id', value='d', length=1},
+    Int32Length{name='length'},
+    Bytes{name='data'}},
   Describe = {
     Bytes{name='id', value='D', length=1},
     Int32Length{name='length'},
@@ -519,10 +523,26 @@ pgdriver.FE_MESSAGES = {
     Int32Length{name='length'},
     String{name='portal'},
     Int32{name='maxrows'}},
+  Flush = {
+    Bytes{name='id', value='H', length=1},
+    Int32Length{name='length'}},
+  Parse = {
+    Bytes{name='id', value='P', length=1},
+    Int32Length{name='length'},
+    String{name='name'},
+    String{name='query'},
+    Int16Array{name='parameters',
+      Int32{name='typeoid'}}},
   Query = {
     Bytes{name='id', value='Q', length=1},
     Int32Length{name='length'},
-    String{name='query'}}
+    String{name='query'}},
+  Sync = {
+    Bytes{name='id', value='S', length=1},
+    Int32Length{name='length'}},
+  Terminate = {
+    Bytes{name='id', value='X', length=1},
+    Int32Length{name='length'}},
 }
 
 -- Messages that can be received from the server, or (F&B) when they can be
@@ -570,7 +590,7 @@ pgdriver.registerMessages {
     Int32{name='pid'},
     Int32{name='secret'}},
   BindComplete = {
-    Bytes{name='id', value='1', length=1},
+    Bytes{name='id', value='2', length=1},
     Int32Length{name='length'}},
   CloseComplete = {
     Bytes{name='id', value='3', length=1},
@@ -583,6 +603,9 @@ pgdriver.registerMessages {
     Bytes{name='id', value='d', length=1},
     Int32Length{name='length'},
     Bytes{name='data'}},
+  CopyDone = { -- (F&B)
+    Bytes{name='id', value='c', length=1},
+    Int32Length{name='length'}},
   DataRow = {
     Bytes{name='id', value='D', length=1},
     Int32Length{name='length'},
@@ -598,9 +621,6 @@ pgdriver.registerMessages {
     NilTerminatedArray{name='fields',
       Bytes{name='type', length=1},
       String{name='value'}}},
-  Flush = {
-    Bytes{name='id', value='H', length=1},
-    Int32Length{name='length'}},
   FunctionCall = {
     Bytes{name='id', value='F', length=1},
     Int32Length{name='length'},
@@ -645,13 +665,6 @@ pgdriver.registerMessages {
     Int32Length{name='length'},
     String{name='name'},
     String{name='value'}},
-  Parse = {
-    Bytes{name='id', value='P', length=1},
-    Int32Length{name='length'},
-    String{name='name'},
-    String{name='query'},
-    Int16Array{name='parameters',
-      Int32{name='typeoid'}}},
   ParseComplete = {
     Bytes{name='id', value='1', length=1},
     Int32Length{name='length'}},
@@ -684,12 +697,6 @@ pgdriver.registerMessages {
     Int32Length{name='length'},
     Int32{name='version', value=3*65536 + 0},
     StringMap{name='parameters', mandatory={'user'}}},
-  Sync = {
-    Bytes{name='id', value='S', length=1},
-    Int32Length{name='length'}},
-  Terminate = {
-    Bytes{name='id', value='X', length=1},
-    Int32Length{name='length'}}
 }
 
 -------------------------------------------------------------------------------
@@ -829,6 +836,7 @@ function pgdriver:query(sql)
   self:_send(self.FE_MESSAGES.Query, {query=sql})
   local currentQuery = {}
   self.currentQuery = currentQuery
+  self.commandComplete = nil
   local cols
   local currentError
   return function()
@@ -860,6 +868,113 @@ function pgdriver:query(sql)
         -- docs say ErrorResponse is always followed by ReadyForQuery
       else
         error('unsupported message ' .. name)
+      end
+    end
+  end
+end
+
+function pgdriver:mquery(sql, rows)
+  local name, pkt, currentError, cols, numparams
+  assert(type(sql) == 'string')
+  assert(self.status == 'ReadyForQuery')
+  self.status = 'InQuery'
+
+  -- Protocol summary:
+  -- 1. send Parse, receive ParseComplete | ErrorResponse.
+  -- 3. send Describe, Flush, receive ParameterDescription, receive RowDescription | NoData.
+  -- 2. send Bind, receive BindComplete | ErrorResponse.
+  -- 3. send Execute, receive one or more DataRow.
+  --    receive exactly one of (CommandComplete | EmptyQueryResponse /*0 rows*/ | ErrorResponse | PortalSuspended /*max rows reached*/)
+  -- 4. send Sync, receive ReadyForQuery.
+
+  self:_send(self.FE_MESSAGES.Parse, {name='', query=sql, parameters={}})
+  self:_send(self.FE_MESSAGES.Describe, {name='', type='S'})
+  self:_send(self.FE_MESSAGES.Flush, {})
+  while true do
+    name, pkt = self:_receive()
+    -- print('debug: received', name, tabletostring(pkt))
+    if name == 'ParseComplete' then
+      -- ok
+    elseif name == 'NoData' then
+      break
+    elseif name == 'ParameterDescription' then
+      numparams = #pkt.parameters
+    elseif name == 'RowDescription' then
+      cols = pkt.cols
+      break
+    elseif name == 'ErrorResponse' then
+      currentError = tabletostring(pkt)
+      self:_send(self.FE_MESSAGES.Sync, {})
+    elseif name == 'ReadyForQuery' then
+      self.status = 'ReadyForQuery'
+      error(currentError or 'unexpected ReadyForQuery without ErrorResponse')
+    else
+      error('unsupported message ' .. name)
+    end
+  end
+
+  local values = {}
+  for _, row in ipairs(rows) do
+    for i = 1, numparams do
+      values[i] = {value = row[i]~=nil and tostring(row[i]) or nil}
+    end
+    self:_send(self.FE_MESSAGES.Bind, {
+      portal='', source='', -- unnamed statement
+      parameterFormats={}, -- all parameters have text format
+      parameterValues=values, -- array of {value:string|nil}
+      resultFormats={},
+    }) -- all results have text format
+    self:_send(self.FE_MESSAGES.Execute, {portal='', maxrows=row.maxrows or 0})
+  end
+  self:_send(self.FE_MESSAGES.Sync, {})
+
+  local finalized = false -- set to true when ReadyForQuery has been received
+  return function()
+    if finalized then return end
+    local completed = false -- set to true when the specific execution has completed
+    self.commandComplete = nil
+    repeat
+      name, pkt = self:_receive()
+      if name == 'ReadyForQuery' then
+        finalized = true
+        return
+      end
+    until name ~= 'BindComplete'
+    return function()
+      while true do
+        if completed or finalized then return end
+        if name == nil then name, pkt = self:_receive() end
+        -- print('debug: received', name, tabletostring(pkt))
+        if name == 'DataRow' then
+          name = nil
+          local row = {}
+          for i, col in ipairs(pkt.cols) do
+            row[i] = col.data
+            if cols and cols[i] and cols[i].name then
+              row[cols[i].name] = col.data
+            end
+          end
+          return row
+        elseif name == 'ReadyForQuery' then
+          finalized = true
+          if currentError then error(currentError) end
+          return
+        elseif name == 'CommandComplete' then
+          self.commandComplete = pkt.command
+          completed = true
+          return
+        elseif name == 'EmptyQueryResponse' then
+          completed = true
+          return
+        elseif name == 'ErrorResponse' then
+          name = nil
+          currentError = currentError or tabletostring(pkt) -- followed by ReadyForQuery
+        elseif name == 'PortalSuspended' then
+          completed = true
+          return
+        else
+          error('unsupported message ' .. name)
+        end
       end
     end
   end
@@ -916,6 +1031,17 @@ function pgdriver.sync_load_test()
       --print(i, #dbs, 'row:', tabletostring(row))
     end
     --print(i, nrows)
+  end
+end
+
+function pgdriver.mquery_sync_test()
+  local db = pgdriver:new{}
+  local nrow = 0
+  for q in db:mquery('select coalesce($1, 0) + coalesce($2, 0) as s union all select -1;', {{1, 2}, {3}, {nil, 4}}) do
+    for row in q do
+      nrow = nrow + 1
+      assert(tonumber(row.s) == ({3, -1, 3, -1, 4, -1})[nrow])
+    end
   end
 end
 
