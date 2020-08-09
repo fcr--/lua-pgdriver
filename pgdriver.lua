@@ -509,10 +509,6 @@ pgdriver.FE_MESSAGES = {
     Int32Length{name='length'},
     Bytes{name='type', length=1}, -- 'S' (statement) or 'P' (portal)
     String{name='name'}},
-  CopyData = { -- (F&B)
-    Bytes{name='id', value='d', length=1},
-    Int32Length{name='length'},
-    Bytes{name='data'}},
   Describe = {
     Bytes{name='id', value='D', length=1},
     Int32Length{name='length'},
