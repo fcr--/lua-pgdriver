@@ -84,7 +84,7 @@ for q in conn:mquery([[SELECT $1, i FROM generate_series(1, $2) i]], {
   {"a", 1},
   {"b", 2},
 }) do
-  for row in q do print(row[1], row[2])end
+  for row in q do print(row[1], row[2]) end
 end
 -- prints:
 a       1
