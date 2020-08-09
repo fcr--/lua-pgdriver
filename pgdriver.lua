@@ -873,7 +873,10 @@ function pgdriver:query(sql)
   end
 end
 
-function pgdriver:mquery(sql, rows)
+-- sql: string
+-- calls: array<{maxrows:nil|number} & array<nil|tostringable>>, the sql query will be
+--     executed once for each entry in calls array.
+function pgdriver:mquery(sql, calls)
   local name, pkt, currentError, cols, numparams
   assert(type(sql) == 'string')
   assert(self.status == 'ReadyForQuery')
@@ -881,10 +884,14 @@ function pgdriver:mquery(sql, rows)
 
   -- Protocol summary:
   -- 1. send Parse, receive ParseComplete | ErrorResponse.
-  -- 3. send Describe, Flush, receive ParameterDescription, receive RowDescription | NoData.
-  -- 2. send Bind, receive BindComplete | ErrorResponse.
-  -- 3. send Execute, receive one or more DataRow.
-  --    receive exactly one of (CommandComplete | EmptyQueryResponse /*0 rows*/ | ErrorResponse | PortalSuspended /*max rows reached*/)
+  -- 2. send Describe & Flush, receive ParameterDescription, receive RowDescription | NoData.
+  -- For each call in calls:
+  --   3.1. send Bind, receive BindComplete | ErrorResponse.
+  --   3.2. send Execute, receive one or more DataRow, receive exactly one of:
+  --        a. CommandComplete: the query does not return a resultset.
+  --        b. EmptyQueryResponse: empty resultset.
+  --        c. ErrorResponse: something failed in the middle (further cals get ignored).
+  --        d. PortalSuspended: max rows reached.
   -- 4. send Sync, receive ReadyForQuery.
 
   self:_send(self.FE_MESSAGES.Parse, {name='', query=sql, parameters={}})
@@ -914,9 +921,9 @@ function pgdriver:mquery(sql, rows)
   end
 
   local values = {}
-  for _, row in ipairs(rows) do
+  for _, call in ipairs(calls) do
     for i = 1, numparams do
-      values[i] = {value = row[i]~=nil and tostring(row[i]) or nil}
+      values[i] = {value = call[i]~=nil and tostring(call[i]) or nil}
     end
     self:_send(self.FE_MESSAGES.Bind, {
       portal='', source='', -- unnamed statement
