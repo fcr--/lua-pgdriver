@@ -70,12 +70,26 @@ local conn = pgdriver:new{host='localhost', port=5432, password='foobar',
 
 Just a simple query with:
 ```lua
-for row in conn:query [[SELECT 'uno' AS f UNION ALL SELECT 'dos']]
+for row in conn:query [[SELECT 'uno' AS f UNION ALL SELECT 'dos']] do
   print(row[1], row.f) -- fields can be accesed both by name and by index
 end
 -- prints:
 -- uno     uno
 -- dos     dos
+```
+
+Or if your query has parameters (to avoid SQL injection), or if you want to execute the same statement many times:
+```lua
+for q in conn:mquery([[SELECT $1, i FROM generate_series(1, $2) i]], {
+  {"a", 1},
+  {"b", 2},
+}) do
+  for row in q do print(row[1], row[2])end
+end
+-- prints:
+a       1
+b       1
+b       2
 ```
 
 ## Running a load test:
