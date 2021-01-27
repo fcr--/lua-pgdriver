@@ -720,13 +720,17 @@ function pgdriver:_init(options)
   self:_connect()
 end
 
-function pgdriver:_connect()
-  local name, pkt
+function pgdriver:close()
   if self.socket then
     self.socket:close()
     self.socket = nil
   end
   self.status = 'Closed'
+end
+
+function pgdriver:_connect()
+  local name, pkt
+  self:close()
   if unixOk and not self.host then
     self.socket = assert(self.socketWrapper(assert(unix())))
     if not self.socket:connect(self.unixPath) then self.socket = nil end
@@ -790,6 +794,7 @@ function pgdriver:_receive(messageTypes)
   if not header then -- ie: connection closed
     -- print(debug.traceback())
     self.socket:close()
+    self.socket = nil
     error('failure reading header from connection: ' .. msg)
   end
   len = decodeInt32(header, headerlen - 3)

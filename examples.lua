@@ -1,3 +1,4 @@
+require 'set_paths'
 local pgdriver = require 'pgdriver'
 local copasOk, copas = pcall(require, 'copas')
 
@@ -26,8 +27,8 @@ local sslparams = {
   key = os.getenv'HOME' .. '/.postgresql/postgresql.key',
   certificate = os.getenv'HOME' .. '/.postgresql/postgresql.crt',
   cafile = os.getenv'HOME' .. '/.postgresql/root.crt',
-  verify = "peer",
-  options = {"all", "no_sslv3"}
+  verify = 'peer',
+  options = {'all', 'no_sslv3'}
 }
 
 -- example for unix namespace sockets:
@@ -97,6 +98,29 @@ function examples.load_test()
     end
     q:wait()
   end))
+  copas.loop()
+end
+
+function examples.pool()
+  local Pool = require 'pool'
+  copas.autoclose = false
+  local dbpool = Pool:new {
+    factory = function() return pgdriver:new{socketWrapper=copas.wrap} end,
+    expiration = 100,
+  }
+  copas.addthread(function()
+    dbpool:with(function(db)
+      for row in db:query "select 'single request'" do print(row[1]) end
+    end)
+    -- then let's start 1000 parallel requests using a pool of 10 connections
+    for i = 1, 1000 do
+      copas.addthread(function()
+        dbpool:with(function(db)
+          for row in db:query(('select %d, pg_sleep(0.1)'):format(i)) do print(row[1]) end
+        end)
+      end)
+    end
+  end)
   copas.loop()
 end
 
