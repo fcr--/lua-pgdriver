@@ -44,6 +44,7 @@ pgdriver.MESSAGES_BY_CODE = {} -- id:char -> name:string -> message
   currentQuery: object pointing to the current query
   commandComplete: the output of the last CommandComplete (showing affected rows for example)
   sm: state machine
+  debug: boolean flag defaults false
 ]]
 
 local function tabletostring(obj)
@@ -471,6 +472,7 @@ end
 
 function pgdriver.registerMessages(messages)
   for name, msg in pairs(messages) do
+    msg.NAME = name
     if msg[1].T == 'Bytes' and type(msg[1].value) == 'string' and #msg[1].value == 1 and msg[2].T == 'Int32Length' then
       local g = pgdriver.MESSAGES_BY_CODE[msg[1].value]
       if not g then
@@ -540,6 +542,10 @@ pgdriver.FE_MESSAGES = {
     Bytes{name='id', value='X', length=1},
     Int32Length{name='length'}},
 }
+
+for name, msg in pairs(pgdriver.FE_MESSAGES) do
+  msg.NAME = name
+end
 
 -- Messages that can be received from the server, or (F&B) when they can be
 -- sent by the driver as well.  They will be registered in pgdriver.MESSAGES.
@@ -717,6 +723,7 @@ function pgdriver:_init(options)
         local obj = self for component in path:gmatch'%w+' do obj = obj[component] end return obj
       end)
   self.sm = {}
+  self.debug = options.debug or false
   self:_connect()
 end
 
@@ -765,7 +772,6 @@ function pgdriver:_connect()
   end
   while true do
     local name, msg = self:_receive()
-    -- print(name, tabletostring(msg))
     if name == 'ReadyForQuery' then
       self.status = 'ReadyForQuery'
       return self -- self is returned to allow a fluid interface
@@ -792,7 +798,7 @@ function pgdriver:_receive(messageTypes)
   end
   header, msg = self.socket:receive(headerlen)
   if not header then -- ie: connection closed
-    -- print(debug.traceback())
+    if self.debug then print(debug.traceback()) end
     self.socket:close()
     self.socket = nil
     error('failure reading header from connection: ' .. msg)
@@ -814,6 +820,7 @@ function pgdriver:_receive(messageTypes)
       if arg2 ~= #data + 1 then
         print(('error? out of sync %s, %d!=%d+1, data=%q'):format(name, arg2, #data, data))
       end
+      if self.debug then print('debug: received', name, tabletostring(pkt)) end
       return name, pkt
     else -- arg2 is an error value
       errors[#errors + 1] = ('  %q: %s'):format(name, arg2)
@@ -823,6 +830,7 @@ function pgdriver:_receive(messageTypes)
 end
 
 function pgdriver:_send(messageType, pkt)
+  if self.debug then print('debug: sent', messageType.NAME, tabletostring(pkt)) end
   self.socket:send(AbstractField.formatrec(messageType, pkt))
 end
 
@@ -881,6 +889,7 @@ function pgdriver:mquery(sql, calls)
   local name, pkt, currentError, cols, numparams
   assert(type(sql) == 'string')
   assert(self.status == 'ReadyForQuery')
+  assert(calls[1])
   self.status = 'InQuery'
 
   -- Protocol summary:
@@ -900,13 +909,34 @@ function pgdriver:mquery(sql, calls)
   self:_send(self.FE_MESSAGES.Flush, {})
   while true do
     name, pkt = self:_receive()
-    -- print('debug: received', name, tabletostring(pkt))
     if name == 'ParseComplete' then
       -- ok
     elseif name == 'NoData' then
       break
     elseif name == 'ParameterDescription' then
       numparams = #pkt.parameters
+      -- ok, so the reason we send the bind&executes here is because if the statement we are
+      -- sending is a NoData kind of query (delete/insert/update without returning) then
+      -- postgresql won't send the NoData unless we send the rows first.  Don't ask me why
+      -- this happens, but it does happen.
+      local values = {}
+      for _, call in ipairs(calls) do
+        for i = 1, numparams do
+          values[i] = {value = call[i]~=nil and tostring(call[i]) or nil}
+        end
+        self:_send(self.FE_MESSAGES.Bind, {
+          portal='', source='', -- unnamed statement
+          parameterFormats={}, -- all parameters have text format
+          parameterValues=values, -- array of {value:string|nil}
+          resultFormats={},
+        }) -- all results have text format
+        self:_send(self.FE_MESSAGES.Execute, {portal='', maxrows=call.maxrows or 0})
+      end
+      -- this flush is to let postgresql know that we want it to process the executes we've sent.
+      self:_send(self.FE_MESSAGES.Flush, {})
+
+      -- at this point the last message we received from postgresql is a ParseDescription,
+      -- it means that we expect RowDescription or NoData to go next
     elseif name == 'RowDescription' then
       cols = pkt.cols
       break
@@ -921,19 +951,6 @@ function pgdriver:mquery(sql, calls)
     end
   end
 
-  local values = {}
-  for _, call in ipairs(calls) do
-    for i = 1, numparams do
-      values[i] = {value = call[i]~=nil and tostring(call[i]) or nil}
-    end
-    self:_send(self.FE_MESSAGES.Bind, {
-      portal='', source='', -- unnamed statement
-      parameterFormats={}, -- all parameters have text format
-      parameterValues=values, -- array of {value:string|nil}
-      resultFormats={},
-    }) -- all results have text format
-    self:_send(self.FE_MESSAGES.Execute, {portal='', maxrows=row.maxrows or 0})
-  end
   self:_send(self.FE_MESSAGES.Sync, {})
 
   local finalized = false -- set to true when ReadyForQuery has been received
@@ -941,18 +958,13 @@ function pgdriver:mquery(sql, calls)
     if finalized then return end
     local completed = false -- set to true when the specific execution has completed
     self.commandComplete = nil
-    repeat
-      name, pkt = self:_receive()
-      if name == 'ReadyForQuery' then
-        finalized = true
-        return
-      end
-    until name ~= 'BindComplete'
+    -- we need this following block only for just one reason: because a ReadyForQuery could be
+    -- immediately returned if there were no queries to process :S
+    name, pkt = self:_receive()
     return function()
       while true do
-        if completed or finalized then return end
+        if finalized then return end
         if name == nil then name, pkt = self:_receive() end
-        -- print('debug: received', name, tabletostring(pkt))
         if name == 'DataRow' then
           name = nil
           local row = {}
@@ -963,29 +975,45 @@ function pgdriver:mquery(sql, calls)
             end
           end
           return row
+        elseif name == 'BindComplete' then
+          if completed then return end -- proceed with next message
         elseif name == 'ReadyForQuery' then
           finalized = true
+          self.status = 'ReadyForQuery'
           if currentError then error(currentError) end
           return
         elseif name == 'CommandComplete' then
           self.commandComplete = pkt.command
           completed = true
-          return
         elseif name == 'EmptyQueryResponse' then
           completed = true
-          return
         elseif name == 'ErrorResponse' then
-          name = nil
           currentError = currentError or tabletostring(pkt) -- followed by ReadyForQuery
         elseif name == 'PortalSuspended' then
+          self.commandComplete = 'PortalSuspended'
           completed = true
-          return
         else
           error('unsupported message ' .. name)
         end
+        name = nil
       end
     end
   end
+end
+
+-- same arguments as mquery, with the difference is that this is not an iterator, instead we
+-- return an array whose i-th element is
+--   an array of the rows returned for the i-th call.
+-- this function is very practical also if you know that there are no returns, if you don't
+-- care about them or if you only want to accumulate the results
+function pgdriver:mexec(sql, calls)
+  local res = {}
+  for q in self:mquery(sql, calls) do
+    local rows = {}
+    for row in q do rows[#rows + 1] = row end
+    res[#res + 1] = rows
+  end
+  return res
 end
 
 return pgdriver

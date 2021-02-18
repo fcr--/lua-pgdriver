@@ -92,6 +92,11 @@ b       1
 b       2
 ```
 
+If you don't care about the results or only want to collect them into an array, you can use the `mexec` method, that accepts the same arguments as `mquery` (in fact it's just a simple wrapper):
+```lua
+conn:mexec([[INSERT INTO foo(x, y) VALUES($1, $2)]], {{x1, y1}, {x2, y2}, {x3, y3}})
+```
+
 ## Running a load test:
 ```bash
 time luajit -e 'require"pgdriver".load_test()' | tail

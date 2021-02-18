@@ -69,6 +69,18 @@ function examples.mquery_sync_test()
   end
 end
 
+function examples.mexec_test()
+  local db = pgdriver:new{}
+  local res = db:mexec('select $1 un', {{'a'}, {42}})
+  assert(#res==2 and #res[1]==1 and #res[1][1]==1, 'two queries, one row, one column')
+  assert(res[1][1][1]=='a' and res[2][1][1] == '42')
+  assert(res[1][1].un=='a' and res[2][1].un == '42')
+
+  res = db:mexec('select 2*$1 foo union all select $2', {{7, 42}})
+  assert(#res==1 and #res[1]==2 and #res[1][1]==1, 'one query, two rows, one column')
+  assert(res[1][1][1] == '14' and res[1][2].foo == '42')
+end
+
 function examples.load_test()
   copas.limit = require 'copas.limit'
   copas.autoclose = false
