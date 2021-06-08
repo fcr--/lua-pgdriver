@@ -1,4 +1,3 @@
-require 'set_paths'
 local pgdriver = require 'pgdriver'
 local copasOk, copas = pcall(require, 'copas')
 
@@ -114,24 +113,29 @@ function examples.load_test()
 end
 
 function examples.pool()
-  local Pool = require 'pool'
+  local Pool = require 'pgdriver.pool'
   copas.autoclose = false
   local dbpool = Pool:new {
+    max_resources = 10,
     factory = function() return pgdriver:new{socketWrapper=copas.wrap} end,
     expiration = 100,
+    timeout = 30,
   }
   copas.addthread(function()
     dbpool:with(function(db)
       for row in db:query "select 'single request'" do print(row[1]) end
     end)
+    q = require 'copas.limit'.new(1000)
     -- then let's start 1000 parallel requests using a pool of 10 connections
     for i = 1, 1000 do
-      copas.addthread(function()
+      q:addthread(function()
         dbpool:with(function(db)
           for row in db:query(('select %d, pg_sleep(0.1)'):format(i)) do print(row[1]) end
         end)
       end)
     end
+    q:wait()
+    dbpool:close()
   end)
   copas.loop()
 end
